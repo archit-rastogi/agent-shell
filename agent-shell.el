@@ -1630,12 +1630,13 @@ COMMAND, when present, may be a shell command string or an argv vector."
   "Return non-nil if STATE has in-flight requests awaiting responses."
   (map-elt state :active-requests))
 
+
 (defun agent-shell--session-bound-notification-p (acp-notification)
   "Return non-nil if ACP-NOTIFICATION reports session request progress.
 
-These notifications must arrive while an agent request is in
-flight (`session/prompt', `session/load', or `session/push').
-A server emitting one with no request active is non-conformant."
+  These notifications must arrive while an agent request is in
+  flight (`session/prompt', `session/load', or `session/push').
+  A server emitting one with no request active is non-conformant."
   (and (equal (map-elt acp-notification 'method) "session/update")
        (member (map-nested-elt acp-notification '(params update sessionUpdate))
                '("tool_call" "tool_call_update"
@@ -1690,6 +1691,23 @@ Includes pretty-printed JSON and a `file a feature request' link."
             (insert (json-serialize acp-notification))
             (json-pretty-print (point-min) (point-max))
             (buffer-string))))
+
+(defun agent-shell--format-tool-call-input (raw-input)
+  "Format RAW-INPUT from a tool call as a fenced code block.
+
+RAW-INPUT is the alist parsed from an ACP tool call's `rawInput' field.
+If it has exactly one key whose value is a non-empty string, that value
+is rendered inside a bare fence.  Otherwise RAW-INPUT is rendered as
+pretty-printed JSON inside a json fence."
+  (if-let* (((= (length raw-input) 1))
+            (value (cdar raw-input))
+            ((and (stringp value) (not (string-empty-p value)))))
+      (format "```\n%s\n```" value)
+    (format "```json\n%s\n```"
+            (with-temp-buffer
+              (insert (json-serialize acp-notification))
+              (json-pretty-print (point-min) (point-max))
+              (buffer-string)))))
 
 (cl-defun agent-shell--on-notification (&key state acp-notification)
   "Handle incoming ACP-NOTIFICATION using STATE."
