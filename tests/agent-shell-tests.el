@@ -438,20 +438,82 @@
     (let ((uris (agent-shell--collect-attached-files blocks)))
       (should (= (length uris) 2)))))
 
+(ert-deftest agent-shell--get-numbered-region-test ()
+  "Test `agent-shell--get-numbered-region' preserves selection and respects TRIM."
+  (with-temp-buffer
+    ;; Lines: 1="", 2="foo", 3="", 4="bar", 5="" (trailing newline).
+    (insert "
+foo
+
+bar
+")
+    ;; Without TRIM: empty boundary lines (1 and 5) are preserved.
+    (should (equal (agent-shell--get-numbered-region
+                    :buffer (current-buffer)
+                    :from (point-min)
+                    :to (point-max))
+                   "   1: 
+   2: foo
+   3: 
+   4: bar
+   5: "))
+    ;; With TRIM: empty boundary lines are stripped, internal empty kept.
+    (should (equal (agent-shell--get-numbered-region
+                    :buffer (current-buffer)
+                    :from (point-min)
+                    :to (point-max)
+                    :trim t)
+                   "   2: foo
+   3: 
+   4: bar"))))
+
+(ert-deftest agent-shell--expand-truncated-regions-test ()
+  "Test `agent-shell--expand-truncated-regions' substitutes marked spans for their full text."
+  ;; No marked regions: prompt unchanged.
+  (should (equal (agent-shell--expand-truncated-regions "plain prompt") "plain prompt"))
+
+  ;; Single marked region: span replaced with `agent-shell-region-text'.
+  (let* ((preview (propertize "1: foo\n   Expand..."
+                              'agent-shell-region-id 'r1
+                              'agent-shell-region-text "1: foo\n2: bar\n3: baz"))
+         (prompt (concat "before " preview " after")))
+    (should (equal (agent-shell--expand-truncated-regions prompt)
+                   "before 1: foo\n2: bar\n3: baz after")))
+
+  ;; Multiple marked regions: each expanded; forward iteration handles all.
+  (let* ((a (propertize "A-preview"
+                        'agent-shell-region-id 'a
+                        'agent-shell-region-text "A-full"))
+         (b (propertize "B-preview"
+                        'agent-shell-region-id 'b
+                        'agent-shell-region-text "B-full-LONGER"))
+         (prompt (concat "x " a " y " b " z")))
+    (should (equal (agent-shell--expand-truncated-regions prompt)
+                   "x A-full y B-full-LONGER z")))
+
+  ;; Region with id but missing text property: span left alone.
+  (let ((prompt (concat "keep "
+                        (propertize "preview" 'agent-shell-region-id 'r)
+                        " me")))
+    (should (equal (agent-shell--expand-truncated-regions prompt) "keep preview me"))))
+
 (ert-deftest agent-shell--send-command-integration-test ()
   "Integration test: verify agent-shell--send-command calls ACP correctly."
   (let ((sent-request nil)
         (agent-shell--state (list
                              (cons :client 'test-client)
-                             (cons :session (list (cons :id "test-session")))
+                             (cons :session (list (cons :id "test-session") (cons :title nil)))
                              (cons :prompt-capabilities '((:embedded-context . t)))
                              (cons :buffer (current-buffer))
                              (cons :last-entry-type nil)
-                             (cons :active-requests nil))))
+                             (cons :active-requests nil)
+                             (cons :idle-timer nil))))
 
     ;; Mock acp-send-request to capture what gets sent;
     ;; stub viewport--buffer to avoid interactive shell-buffer prompt in batch.
-    (cl-letf (((symbol-function 'acp-send-request)
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () agent-shell--state))
+              ((symbol-function 'acp-send-request)
                (lambda (&rest args)
                  (setq sent-request args)))
               ((symbol-function 'agent-shell-viewport--buffer)
@@ -477,15 +539,18 @@
   (let ((sent-request nil)
         (agent-shell--state (list
                              (cons :client 'test-client)
-                             (cons :session (list (cons :id "test-session")))
+                             (cons :session (list (cons :id "test-session") (cons :title nil)))
                              (cons :prompt-capabilities '((:embedded-context . t)))
                              (cons :buffer (current-buffer))
                              (cons :last-entry-type nil)
-                             (cons :active-requests nil))))
+                             (cons :active-requests nil)
+                             (cons :idle-timer nil))))
 
     ;; Mock build-content-blocks to throw an error;
     ;; stub viewport--buffer to avoid interactive shell-buffer prompt in batch.
-    (cl-letf (((symbol-function 'agent-shell--build-content-blocks)
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () agent-shell--state))
+              ((symbol-function 'agent-shell--build-content-blocks)
                (lambda (_prompt)
                  (error "Simulated error in build-content-blocks")))
               ((symbol-function 'acp-send-request)
@@ -522,10 +587,11 @@
         (agent-shell--state (list (cons :buffer (current-buffer))
                                   (cons :event-subscriptions nil)
                                   (cons :client 'test-client)
-                                  (cons :session (list (cons :id "test-session")))
+                                  (cons :session (list (cons :id "test-session") (cons :title nil)))
                                   (cons :last-entry-type nil)
                                   (cons :tool-calls nil)
-                                  (cons :usage (list (cons :total-tokens 0)))))
+                                  (cons :usage (list (cons :total-tokens 0)))
+                                  (cons :idle-timer nil)))
         (agent-shell-show-busy-indicator nil)
         (agent-shell-show-usage-at-turn-end nil))
     (cl-letf (((symbol-function 'agent-shell--state)
@@ -630,6 +696,231 @@
   ;; Test with all capabilities disabled (should return empty string)
   (let ((capabilities '((promptCapabilities (image . :false) (audio . :false)))))
     (should (equal (agent-shell--format-agent-capabilities capabilities) ""))))
+
+(ert-deftest agent-shell--normalize-config-options-test ()
+  "Test `agent-shell--normalize-config-options'."
+  (let ((options (agent-shell--normalize-config-options
+                  [((id . "mode")
+                    (name . "Session Mode")
+                    (description . "Controls permissions")
+                    (category . "mode")
+                    (type . "select")
+                    (currentValue . "ask")
+                    (options . [((value . "ask")
+                                 (name . "Ask")
+                                 (description . "Ask first"))
+                                ((value . "code")
+                                 (name . "Code"))]))
+                    ((id . "verbosity")
+                     (name . "Verbosity")
+                     (type . "select")
+                     (currentValue . "normal")
+                     (options . [((value . "normal")
+                                  (name . "Normal"))]))])))
+    (should (equal (map-elt (car options) :id) "mode"))
+    (should (equal (map-elt (car options) :category) "mode"))
+    (should (equal (map-elt (car options) :current-value) "ask"))
+    (should (equal (map-elt (car (map-elt (car options) :options)) :value)
+                   "ask"))
+    (should-not (agent-shell--config-option-by-category
+                 (list (cons :config-options options))
+                 "model"))))
+
+(ert-deftest agent-shell--session-from-response-config-options-test ()
+  "Test `agent-shell--session-from-response' stores config options."
+  (let ((session (agent-shell--session-from-response
+                  :acp-session-id "session-1"
+                  :acp-response
+                  '((configOptions . [((id . "model")
+                                       (name . "Model")
+                                       (category . "model")
+                                       (type . "select")
+                                       (currentValue . "gpt-5")
+                                       (options . [((value . "gpt-5")
+                                                    (name . "GPT-5"))]))])))))
+    (should (equal (map-elt session :id) "session-1"))
+    (should (equal (map-elt (car (map-elt session :config-options)) :id)
+                   "model"))))
+
+(ert-deftest agent-shell--config-option-update-test ()
+  "Test config_option_update refreshes config option state."
+  (let ((state (list (cons :session (list (cons :id "session-1")
+                                          (cons :config-options nil)))
+                     (cons :config-options nil)
+                     (cons :last-activity-time nil)))
+        (config-options [((id . "mode")
+                          (name . "Mode")
+                          (category . "mode")
+                          (type . "select")
+                          (currentValue . "code")
+                          (options . [((value . "code")
+                                       (name . "Code"))]))]))
+    (cl-letf (((symbol-function 'agent-shell--update-header-and-mode-line)
+               #'ignore)
+              ;; `--emit-event' calls `(agent-shell--state)' which errors
+              ;; outside of an `agent-shell-mode' buffer; the test exercises
+              ;; the data layer, not subscription dispatch.
+              ((symbol-function 'agent-shell--emit-event)
+               #'ignore))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification `((method . "session/update")
+                           (params
+                            (update
+                             (sessionUpdate . "config_option_update")
+                             (configOptions . ,config-options))))))
+    (should (equal (map-elt (car (map-elt state :config-options)) :current-value)
+                   "code"))))
+
+(ert-deftest agent-shell--config-option-set-model-id-config-option-test ()
+  "Test model changes prefer session config options."
+  (let* ((initial-config-options [((id . "model")
+                                   (name . "Model")
+                                   (category . "model")
+                                   (type . "select")
+                                   (currentValue . "gpt-5")
+                                   (options . [((value . "gpt-5")
+                                                (name . "GPT-5"))
+                                               ((value . "gpt-5.5")
+                                                (name . "GPT-5.5"))]))])
+         (normalized-options (agent-shell--normalize-config-options
+                              initial-config-options))
+         (state (list (cons :client 'test-client)
+                      (cons :session (list (cons :id "session-1")
+                                           (cons :config-options normalized-options)))
+                      (cons :config-options normalized-options)))
+         (sent-request nil)
+         (success-callback nil)
+         (updated-config-options [((id . "model")
+                                   (name . "Model")
+                                   (category . "model")
+                                   (type . "select")
+                                   (currentValue . "gpt-5.5")
+                                   (options . [((value . "gpt-5")
+                                                (name . "GPT-5"))
+                                               ((value . "gpt-5.5")
+                                                (name . "GPT-5.5"))]))]))
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () state))
+              ((symbol-function 'agent-shell--send-request)
+               (lambda (&rest args)
+                 (setq sent-request (plist-get args :request))
+                 (setq success-callback (plist-get args :on-success))))
+              ((symbol-function 'agent-shell--update-header-and-mode-line)
+               #'ignore))
+      (agent-shell--config-option-set-model-id :model-id "gpt-5.5")
+      (should (equal (map-elt sent-request :method)
+                     "session/set_config_option"))
+      (should (equal (map-nested-elt sent-request '(:params configId))
+                     "model"))
+      (funcall success-callback
+               `((configOptions . ,updated-config-options)))
+      (should (equal (agent-shell--current-model-id state) "gpt-5.5")))))
+
+(ert-deftest agent-shell--config-option-set-mode-id-config-option-test ()
+  "Test mode changes prefer session config options."
+  (let* ((initial-config-options [((id . "mode")
+                                   (name . "Mode")
+                                   (category . "mode")
+                                   (type . "select")
+                                   (currentValue . "ask")
+                                   (options . [((value . "ask")
+                                                (name . "Ask"))
+                                               ((value . "auto")
+                                                (name . "Auto"))]))])
+         (normalized-options (agent-shell--normalize-config-options
+                              initial-config-options))
+         (state (list (cons :client 'test-client)
+                      (cons :session (list (cons :id "session-1")
+                                           (cons :config-options normalized-options)))
+                      (cons :config-options normalized-options)))
+         (sent-request nil)
+         (success-callback nil)
+         (updated-config-options [((id . "mode")
+                                   (name . "Mode")
+                                   (category . "mode")
+                                   (type . "select")
+                                   (currentValue . "auto")
+                                   (options . [((value . "ask")
+                                                (name . "Ask"))
+                                               ((value . "auto")
+                                                (name . "Auto"))]))]))
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () state))
+              ((symbol-function 'agent-shell--send-request)
+               (lambda (&rest args)
+                 (setq sent-request (plist-get args :request))
+                 (setq success-callback (plist-get args :on-success))))
+              ((symbol-function 'agent-shell--update-header-and-mode-line)
+               #'ignore))
+      (agent-shell--config-option-set-mode-id :mode-id "auto")
+      (should (equal (map-elt sent-request :method)
+                     "session/set_config_option"))
+      (should (equal (map-nested-elt sent-request '(:params configId))
+                     "mode"))
+      (should (equal (map-nested-elt sent-request '(:params value))
+                     "auto"))
+      (funcall success-callback
+               `((configOptions . ,updated-config-options)))
+      (should (equal (agent-shell--current-mode-id state) "auto")))))
+
+(ert-deftest agent-shell--config-option-set-model-id-legacy-fallback-test ()
+  "Test model changes fall back to legacy ACP model requests."
+  (let* ((models '(((:model-id . "gpt-5")
+                    (:name . "GPT-5"))
+                   ((:model-id . "gpt-5.5")
+                    (:name . "GPT-5.5"))))
+         (session (list (cons :id "session-1")
+                        (cons :model-id "gpt-5")
+                        (cons :models models)))
+         (state (list (cons :client 'test-client)
+                      (cons :session session)))
+         (sent-request nil)
+         (success-callback nil))
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () state))
+              ((symbol-function 'agent-shell--send-request)
+               (lambda (&rest args)
+                 (setq sent-request (plist-get args :request))
+                 (setq success-callback (plist-get args :on-success))))
+              ((symbol-function 'agent-shell--update-header-and-mode-line)
+               #'ignore))
+      (agent-shell--config-option-set-model-id :model-id "gpt-5.5")
+      (should (equal (map-elt sent-request :method)
+                     "session/set_model"))
+      (should (equal (map-nested-elt sent-request '(:params modelId))
+                     "gpt-5.5"))
+      (funcall success-callback nil)
+      (should (equal (agent-shell--current-model-id state) "gpt-5.5")))))
+
+(ert-deftest agent-shell--config-option-set-model-id-config-option-no-echo-test ()
+  "Test model changes update local state when response omits configOptions."
+  (let* ((initial-config-options [((id . "model")
+                                   (name . "Model")
+                                   (category . "model")
+                                   (type . "select")
+                                   (currentValue . "gpt-5")
+                                   (options . [((value . "gpt-5")
+                                                (name . "GPT-5"))
+                                               ((value . "gpt-5.5")
+                                                (name . "GPT-5.5"))]))])
+         (normalized-options (agent-shell--normalize-config-options
+                              initial-config-options))
+         (state (list (cons :client 'test-client)
+                      (cons :session (list (cons :id "session-1")
+                                           (cons :config-options normalized-options)))
+                      (cons :config-options normalized-options)))
+         (success-callback nil))
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () state))
+              ((symbol-function 'agent-shell--send-request)
+               (lambda (&rest args)
+                 (setq success-callback (plist-get args :on-success))))
+              ((symbol-function 'agent-shell--update-header-and-mode-line)
+               #'ignore))
+      (agent-shell--config-option-set-model-id :model-id "gpt-5.5")
+      (funcall success-callback nil)
+      (should (equal (agent-shell--current-model-id state) "gpt-5.5")))))
 
 (ert-deftest agent-shell--make-transcript-tool-call-entry-test ()
   "Test `agent-shell--make-transcript-tool-call-entry' function."
@@ -933,13 +1224,26 @@ code block content
                      (args . ["-y" "@modelcontextprotocol/server-filesystem" "/tmp"])
                      (env . []))])))
 
-  ;; Test server without optional fields
+  ;; Test stdio transport defaults missing ACP collection fields
   (let ((agent-shell-mcp-servers
          '(((name . "simple")
             (command . "simple-server")))))
     (should (equal (agent-shell--mcp-servers)
                    [((name . "simple")
-                     (command . "simple-server"))]))))
+                     (command . "simple-server")
+                     (args . [])
+                     (env . []))])))
+
+  ;; Test HTTP transport defaults missing ACP collection fields
+  (let ((agent-shell-mcp-servers
+         '(((name . "remote")
+            (type . "http")
+            (url . "https://example.com/mcp")))))
+    (should (equal (agent-shell--mcp-servers)
+                   [((name . "remote")
+                     (type . "http")
+                     (url . "https://example.com/mcp")
+                     (headers . []))]))))
 
 (ert-deftest agent-shell--completion-bounds-test ()
   "Test `agent-shell--completion-bounds' function."
@@ -1310,7 +1614,8 @@ code block content
         (agent-shell--state (list (cons :buffer (current-buffer))
                                   (cons :event-subscriptions nil)
                                   (cons :tool-calls nil)
-                                  (cons :last-entry-type nil))))
+                                  (cons :last-entry-type nil)
+                                  (cons :idle-timer nil))))
     (cl-letf (((symbol-function 'agent-shell--state)
                (lambda () agent-shell--state))
               ((symbol-function 'agent-shell--update-fragment)
@@ -1373,6 +1678,41 @@ code block content
       (remove-hook 'agent-shell-mode-hook hook-fn)
       (when (process-live-p fake-process)
         (delete-process fake-process))
+      (when (and test-buffer (buffer-live-p test-buffer))
+        (kill-buffer test-buffer)))))
+
+(ert-deftest agent-shell--start-snapshots-dynamic-session-strategy ()
+  "Starting a shell should localize the effective session strategy."
+  (let ((test-buffer nil)
+        (shell-buffer nil)
+        (fake-process (start-process "fake-agent" nil "cat"))
+        (config (list (cons :buffer-name "test-agent")
+                      (cons :client-maker
+                            (lambda (_buf)
+                              (list (cons :command "cat")))))))
+    (unwind-protect
+        (cl-letf (((symbol-function 'shell-maker-start)
+                   (lambda (_config &rest _args)
+                     (setq test-buffer (get-buffer-create "*test-agent-shell*"))
+                     (with-current-buffer test-buffer
+                       (setq major-mode 'agent-shell-mode))
+                     test-buffer))
+                  ((symbol-function 'shell-maker--process) (lambda () fake-process))
+                  ((symbol-function 'shell-maker-finish-output) #'ignore)
+                  ((symbol-function 'agent-shell--handle) #'ignore)
+                  (agent-shell-file-completion-enabled nil))
+          (let ((agent-shell-session-strategy 'latest))
+            (let ((agent-shell-session-strategy 'prompt))
+              (setq shell-buffer (agent-shell--start :config config
+                                                    :no-focus t
+                                                    :new-session t))))
+          (should (local-variable-p 'agent-shell-session-strategy shell-buffer))
+          (should (eq (buffer-local-value 'agent-shell-session-strategy shell-buffer)
+                      'prompt)))
+      (when (process-live-p fake-process)
+        (delete-process fake-process))
+      (when (and shell-buffer (buffer-live-p shell-buffer))
+        (kill-buffer shell-buffer))
       (when (and test-buffer (buffer-live-p test-buffer))
         (kill-buffer test-buffer)))))
 
@@ -1546,6 +1886,17 @@ code block content
   (cl-letf (((symbol-function 'agent-shell-buffers)
              (lambda () nil)))
     (should-not (agent-shell--prompt-select-session nil))))
+
+(ert-deftest agent-shell--validate-session-strategy-test ()
+  "Test `agent-shell--validate-session-strategy' accepts supported values
+and rejects `new-deferred' and other unknown values."
+  (should-not (agent-shell--validate-session-strategy 'new))
+  (should-not (agent-shell--validate-session-strategy 'latest))
+  (should-not (agent-shell--validate-session-strategy 'prompt))
+  (should-error (agent-shell--validate-session-strategy 'new-deferred)
+                :type 'user-error)
+  (should-error (agent-shell--validate-session-strategy 'bogus)
+                :type 'user-error))
 
 (ert-deftest agent-shell--initiate-session-strategy-new-skips-list-load ()
   "Test `agent-shell--initiate-session' skips list/load when strategy is `new'."
@@ -1922,6 +2273,38 @@ code block content
           (should-not (string-match-p "test-session-id"
                                       (substring-no-properties header))))))))
 
+(ert-deftest agent-shell--make-header-graphical-status-fg-test ()
+  "Test graphical header honors a propertized `:status' foreground."
+  (skip-unless (image-type-available-p 'svg))
+  (with-temp-buffer
+    (setq-local agent-shell--state
+                `((:agent-config . ((:buffer-name . "Test")
+                                    (:icon-name . nil)))
+                  (:session . ((:id . "abc")
+                               (:model-id . nil)
+                               (:models . nil)
+                               (:mode-id . nil)
+                               (:modes . nil)))))
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () agent-shell--state))
+              ((symbol-function 'agent-shell--context-usage-indicator)
+               (lambda () nil))
+              ((symbol-function 'agent-shell--busy-indicator-frame)
+               (lambda () nil))
+              ((symbol-function 'agent-shell--session-id-indicator)
+               (lambda () nil)))
+      (let* ((agent-shell-header-style 'graphical)
+             (agent-shell--header-cache nil)
+             (header (agent-shell--make-header
+                      agent-shell--state
+                      :position "1/3"
+                      :status (propertize "Edit" 'face '(:foreground "#00ff00"))))
+             (svg-data (plist-get (cdr (get-text-property 1 'display header))
+                                  :data)))
+        (should (string-match-p ">1/3</tspan>" svg-data))
+        (should (string-match-p "<tspan[^>]*fill=\"#00ff00\"[^>]*>Edit"
+                                svg-data))))))
+
 ;;; Tests for agent-shell--dot-subdir-in-repo
 
 (ert-deftest agent-shell--dot-subdir-in-repo-returns-path-test ()
@@ -1955,6 +2338,38 @@ code block content
           (let ((agent-shell-dot-subdir-function #'agent-shell--dot-subdir-in-repo))
             (should (equal (agent-shell--dot-subdir "screenshots") expected-dir))))
       (delete-directory temp-dir t))))
+
+(ert-deftest agent-shell--dot-subdir-ensures-gitignore-for-in-repo-directory-test ()
+  "Test that `agent-shell--dot-subdir' ensures gitignore for in-repo data."
+  (let* ((temp-dir (make-temp-file "agent-shell-test" t))
+         (ensure-gitignore-called-with nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-cwd) (lambda () temp-dir))
+                  ((symbol-function 'agent-shell--ensure-gitignore)
+                   (lambda (project-root)
+                     (setq ensure-gitignore-called-with project-root))))
+          (let ((agent-shell-dot-subdir-function #'agent-shell--dot-subdir-in-repo))
+            (agent-shell--dot-subdir "screenshots")
+            (should (equal ensure-gitignore-called-with temp-dir))))
+      (delete-directory temp-dir t))))
+
+(ert-deftest agent-shell--dot-subdir-skips-gitignore-for-external-directory-test ()
+  "Test that `agent-shell--dot-subdir' skips gitignore for external data."
+  (let ((project-dir (make-temp-file "agent-shell-project" t))
+        (data-dir (make-temp-file "agent-shell-data" t))
+        (ensure-gitignore-called nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-cwd) (lambda () project-dir))
+                  ((symbol-function 'agent-shell--ensure-gitignore)
+                   (lambda (_project-root)
+                     (setq ensure-gitignore-called t))))
+          (let ((agent-shell-dot-subdir-function
+                 (lambda (subdir)
+                   (expand-file-name subdir data-dir))))
+            (agent-shell--dot-subdir "screenshots")
+            (should-not ensure-gitignore-called)))
+      (delete-directory project-dir t)
+      (delete-directory data-dir t))))
 
 (ert-deftest agent-shell--dot-subdir-noop-if-directory-exists-test ()
   "Test that `agent-shell--dot-subdir' does not error if the directory already exists."
@@ -2007,20 +2422,22 @@ code block content
   "Test `agent-shell--on-request' calls handler and :respond auto-approves."
   (with-temp-buffer
     (let* ((responded-option-id nil)
+           (received-events nil)
            (handler-received nil)
            (agent-shell-permission-responder-function
             (lambda (request)
               (setq handler-received request)
-              (when-let ((opt (seq-find
-                               (lambda (o) (equal (map-elt o :kind) "allow_once"))
-                               (map-elt request :options))))
+              (when-let* ((opt (seq-find
+                                (lambda (o) (equal (map-elt o :kind) "allow_once"))
+                                (map-elt request :options))))
                 (funcall (map-elt request :respond)
                          (map-elt opt :option-id)))))
            (state `((:buffer . ,(current-buffer))
                     (:client . test-client)
                     (:tool-calls . nil)
                     (:last-entry-type . nil)
-                    (:event-subscriptions . nil))))
+                    (:event-subscriptions . nil)
+                    (:idle-timer . nil))))
       (cl-letf (((symbol-function 'agent-shell--state)
                  (lambda () state))
                 ((symbol-function 'agent-shell--update-fragment)
@@ -2034,6 +2451,11 @@ code block content
                 ((symbol-function 'agent-shell--send-permission-response)
                  (lambda (&rest args)
                    (setq responded-option-id (plist-get args :option-id)))))
+        (agent-shell-subscribe-to
+         :shell-buffer (current-buffer)
+         :event 'permission-request
+         :on-event (lambda (event)
+                     (push event received-events)))
         (agent-shell--on-request
          :state state
          :acp-request `((id . "req-1")
@@ -2052,7 +2474,9 @@ code block content
         (should (equal (map-elt (map-elt handler-received :tool-call) :kind) "read"))
         (should (equal (map-elt (map-elt handler-received :tool-call) :title) "Read file"))
         (should (= (length (map-elt handler-received :options)) 2))
-        (should (equal responded-option-id "opt-allow"))))))
+        (should (equal responded-option-id "opt-allow"))
+        (should-not received-events)
+        (should-not (map-elt state :idle-timer))))))
 
 (ert-deftest agent-shell--on-request-handler-nil-leaves-prompt-test ()
   "Test `agent-shell--on-request' leaves interactive prompt when handler returns nil."
@@ -2064,7 +2488,8 @@ code block content
                     (:client . test-client)
                     (:tool-calls . nil)
                     (:last-entry-type . nil)
-                    (:event-subscriptions . nil))))
+                    (:event-subscriptions . nil)
+                    (:idle-timer . nil))))
       (cl-letf (((symbol-function 'agent-shell--state)
                  (lambda () state))
                 ((symbol-function 'agent-shell--update-fragment)
@@ -2186,13 +2611,11 @@ Based on ACP traffic from https://github.com/xenodium/agent-shell/issues/415."
   (should (equal
            "external_directory (_event.rs)"
            (agent-shell--permission-title
-            :acp-request
-            '((params . ((toolCall . ((toolCallId . "call_ad19e402fcb548c3acd48bbd")
-                                      (status . "pending")
-                                      (title . "external_directory")
-                                      (rawInput . ((filepath . "/home/pmw/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-sdk-s3-1.112.0/src/types/_event.rs")
-                                                   (parentDir . "/home/pmw/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-sdk-s3-1.112.0/src/types")))
-                                      (kind . "other"))))))))))
+            :tool-call
+            '((:title . "external_directory")
+              (:raw-input . ((filepath . "/home/pmw/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-sdk-s3-1.112.0/src/types/_event.rs")
+                             (parentDir . "/home/pmw/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-sdk-s3-1.112.0/src/types")))
+              (:kind . "other"))))))
 
 (ert-deftest agent-shell--permission-title-edit-shows-filename-test ()
   "Test `agent-shell--permission-title' includes filename for edit permission.
@@ -2200,35 +2623,137 @@ Based on ACP traffic from https://github.com/xenodium/agent-shell/issues/415."
   (should (equal
            "edit (s3notifications.rs)"
            (agent-shell--permission-title
-            :acp-request
-            '((params . ((toolCall . ((toolCallId . "call_451e5acf91884aecaadf3173")
-                                      (status . "pending")
-                                      (title . "edit")
-                                      (rawInput . ((filepath . "/home/pmw/Repos/warmup-s3-archives/src/s3notifications.rs")
-                                                   (diff . "Index: /home/pmw/Repos/warmup-s3-archives/src/s3notifications.rs\n")))
-                                      (kind . "edit"))))))))))
+            :tool-call
+            '((:title . "edit")
+              (:raw-input . ((filepath . "/home/pmw/Repos/warmup-s3-archives/src/s3notifications.rs")
+                             (diff . "Index: /home/pmw/Repos/warmup-s3-archives/src/s3notifications.rs\n")))
+              (:kind . "edit"))))))
 
 (ert-deftest agent-shell--permission-title-no-duplicate-filename-test ()
   "Test `agent-shell--permission-title' does not duplicate filename already in title."
   (should (equal
            "Read s3notifications.rs"
            (agent-shell--permission-title
-            :acp-request
-            '((params . ((toolCall . ((toolCallId . "tc-1")
-                                      (title . "Read s3notifications.rs")
-                                      (rawInput . ((filepath . "/home/user/src/s3notifications.rs")))
-                                      (kind . "read"))))))))))
+            :tool-call
+            '((:title . "Read s3notifications.rs")
+              (:raw-input . ((filepath . "/home/user/src/s3notifications.rs")))
+              (:kind . "read"))))))
 
 (ert-deftest agent-shell--permission-title-execute-fenced-test ()
   "Test `agent-shell--permission-title' fences execute commands."
   (should (equal
            "```console\nls -la\n```"
            (agent-shell--permission-title
-            :acp-request
-            '((params . ((toolCall . ((toolCallId . "tc-1")
-                                      (title . "Bash")
-                                      (rawInput . ((command . "ls -la")))
-                                      (kind . "execute"))))))))))
+            :tool-call
+            '((:title . "Bash")
+              (:raw-input . ((command . "ls -la")))
+              (:kind . "execute"))))))
+
+(ert-deftest agent-shell--permission-title-content-folded-test ()
+  "Append ACP `content' text after the title.
+Based on Jane Street AIDE permission requests from
+https://github.com/xenodium/agent-shell-js/issues/27 where
+structured `content' carries the user-facing detail and there
+is no `rawInput'."
+  (should (equal
+           "Link Feature\n\nAllow linking to this session?"
+           (agent-shell--permission-title
+            :tool-call
+            `((:title . "Link Feature")
+              (:kind . "other")
+              (:content . [((type . "content")
+                            (content (type . "text")
+                                     (text . "Allow linking to this session?")))]))))))
+
+(ert-deftest agent-shell--permission-title-content-dedup-against-title-test ()
+  "Skip `content' text already mentioned in the title.
+Claude populates `content' with the same string as
+`rawInput.description'; we should not duplicate the description
+when it is already in the rendered text."
+  (should (equal
+           "```console\nping -c 4 localhost\n```\n\nPing localhost 4 times"
+           (agent-shell--permission-title
+            :tool-call
+            `((:title . "ping -c 4 localhost")
+              (:kind . "execute")
+              (:raw-input . ((command . "ping -c 4 localhost")
+                             (description . "Ping localhost 4 times")))
+              (:content . [((type . "content")
+                            (content (type . "text")
+                                     (text . "Ping localhost 4 times")))]))))))
+
+(ert-deftest agent-shell--permission-title-content-substring-skipped-test ()
+  "Skip `content' text that is a substring of the existing title."
+  (should (equal
+           "Read foo.rs"
+           (agent-shell--permission-title
+            :tool-call
+            `((:title . "Read foo.rs")
+              (:kind . "read")
+              (:content . [((type . "content")
+                            (content (type . "text")
+                                     (text . "Read foo.rs")))]))))))
+
+(ert-deftest agent-shell--permission-title-locations-appended-test ()
+  "Append `locations' paths not already mentioned in the title."
+  (should (equal
+           "Search-url Fetch (https://google.com)"
+           (agent-shell--permission-title
+            :tool-call
+            `((:title . "Search-url Fetch")
+              (:kind . "other")
+              (:locations . [((path . "https://google.com"))]))))))
+
+(ert-deftest agent-shell--permission-title-locations-skipped-when-in-title-test ()
+  "Skip `locations' paths already present in the title."
+  (should (equal
+           "`echo hi`"
+           (agent-shell--permission-title
+            :tool-call
+            `((:title . "`echo hi`")
+              (:kind . "execute")
+              (:locations . [((path . "echo hi"))]))))))
+
+(ert-deftest agent-shell--permission-title-locations-skipped-when-in-content-test ()
+  "Skip `locations' paths already embedded inside `content' text.
+AIDE's url_fetch request sends the URL in both `content' (inside
+a JSON code block) and `locations'; only one copy should render."
+  (should (equal
+           "Search-url Fetch\n\nCall url_fetch with {\"url\": \"https://google.com\"}"
+           (agent-shell--permission-title
+            :tool-call
+            `((:title . "Search-url Fetch")
+              (:kind . "other")
+              (:content . [((type . "content")
+                            (content (type . "text")
+                                     (text . "Call url_fetch with {\"url\": \"https://google.com\"}")))])
+              (:locations . [((path . "https://google.com"))]))))))
+
+(ert-deftest agent-shell--permission-title-locations-basename-skipped-test ()
+  "Skip `locations' paths whose basename was already shown via `rawInput'.
+Some agents populate both `rawInput.filepath' (which we render as
+basename) and `locations' (which has the absolute path); only one
+copy should render."
+  (should (equal
+           "edit (foo.rs)"
+           (agent-shell--permission-title
+            :tool-call
+            `((:title . "edit")
+              (:kind . "edit")
+              (:raw-input . ((filepath . "/home/user/foo.rs")))
+              (:locations . [((path . "/home/user/foo.rs"))]))))))
+
+(ert-deftest agent-shell--permission-title-empty-content-and-locations-test ()
+  "Empty `content' / `locations' vectors should not affect the title.
+Gemini sends these fields as empty arrays."
+  (should (equal
+           "git log --reverse | head -n 1"
+           (agent-shell--permission-title
+            :tool-call
+            `((:title . "git log --reverse | head -n 1")
+              (:kind . "execute")
+              (:content . [])
+              (:locations . []))))))
 
 (ert-deftest agent-shell-restart-preserves-default-directory ()
   "Restart should use the shell's directory, not the fallback buffer's.
@@ -2274,7 +2799,11 @@ that fallback buffer, potentially starting the new shell in the wrong project."
                        (lambda (&rest _args)
                          (setq captured-dir default-directory)
                          (get-buffer-create "*test-restart-new-shell*")))
+                      ((symbol-function 'shell-maker-set-buffer-name)
+                       #'ignore)
                       ((symbol-function 'agent-shell--display-buffer)
+                       #'ignore)
+                      ((symbol-function 'agent-shell-viewport--show-buffer)
                        #'ignore))
               (agent-shell-restart)))
           (should (equal captured-dir project-a)))
@@ -2284,7 +2813,7 @@ that fallback buffer, potentially starting the new shell in the wrong project."
         (kill-buffer shell-buffer))
       (when (and other-buffer (buffer-live-p other-buffer))
         (kill-buffer other-buffer))
-      (when-let ((buf (get-buffer "*test-restart-new-shell*")))
+      (when-let* ((buf (get-buffer "*test-restart-new-shell*")))
         (kill-buffer buf)))))
 
 (ert-deftest agent-shell-sort-sessions-by-recency-test ()
@@ -2314,6 +2843,193 @@ that fallback buffer, potentially starting the new shell in the wrong project."
 
   ;; Empty input returns empty output.
   (should (equal (agent-shell--sort-sessions-by-recency '()) '())))
+
+(ert-deftest agent-shell--clean-up-tolerates-mode-change-test ()
+  "Test `kill-buffer' succeeds after the major mode is manually changed.
+
+`kill-buffer-hook' is permanent-local, so the buffer-local
+`agent-shell--clean-up' entry survives a mode change,
+and it must handle that cleanly."
+  (let ((shell-buf (generate-new-buffer " *test-shell*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buf
+            (setq major-mode 'agent-shell-mode)
+            (setq-local agent-shell--state
+                        (agent-shell--make-state :buffer shell-buf))
+            (add-hook 'kill-buffer-hook #'agent-shell--clean-up nil t)
+            (text-mode))
+          (kill-buffer shell-buf)
+          (should-not (buffer-live-p shell-buf)))
+      (when (buffer-live-p shell-buf)
+        (with-current-buffer shell-buf
+          (remove-hook 'kill-buffer-hook #'agent-shell--clean-up t))
+        (kill-buffer shell-buf)))))
+
+(ert-deftest agent-shell-filter-buffer-substring-strips-hidden-markup ()
+  "Copying text should exclude markdown syntax hidden by overlays."
+  (with-temp-buffer
+    (insert "```emacs-lisp\n(defun foo (x)\n  x)\n```\n")
+    (markdown-overlays-put)
+    (let ((result (agent-shell--filter-buffer-substring (point-min) (point-max))))
+      (should (equal result "(defun foo (x)\n  x)\n\n")))))
+
+(ert-deftest agent-shell-filter-buffer-substring-strips-inline-code-backticks ()
+  "Copying inline code should exclude the surrounding backticks."
+  (with-temp-buffer
+    (insert "Use `foo-bar` for that.")
+    (markdown-overlays-put)
+    (let ((result (agent-shell--filter-buffer-substring (point-min) (point-max))))
+      (should (equal result "Use foo-bar for that.")))))
+
+(ert-deftest agent-shell-trim-strips-untagged-whitespace ()
+  ;; Plain `string-trim'-style behavior when nothing is tagged: outer
+  ;; whitespace is removed.
+  (should (equal "hello"
+                 (agent-shell-trim "\n\n  hello  \n\n"))))
+
+(ert-deftest agent-shell-trim-preserves-tagged-whitespace ()
+  ;; A trailing `\\n' tagged with `agent-shell-non-trimmable'
+  ;; survives the trim — the renderer's panel padding (top/bottom
+  ;; vpad `\\n's around a source block) relies on this so the panel
+  ;; doesn't get clipped on the first / last block of a response.
+  (let* ((tail (propertize "\n" 'agent-shell-non-trimmable t))
+         (s (concat "\n\nhello\n" tail "\n\n")))
+    (should (equal "hello\n\n"
+                   (substring-no-properties
+                    (agent-shell-trim s))))))
+
+(ert-deftest agent-shell-trim-handles-edge-cases ()
+  ;; nil input, empty string, and all-whitespace strings.
+  (should (null (agent-shell-trim nil)))
+  (should (equal "" (agent-shell-trim "")))
+  (should (equal "" (agent-shell-trim "\n\n  \t  \n\n"))))
+
+(defun agent-shell-tests--make-session-update (kind text)
+  "Build a fake `session/update' notification of KIND with TEXT.
+KIND is a sessionUpdate string such as \"user_message_chunk\"."
+  `((method . "session/update")
+    (params . ((update . ((sessionUpdate . ,kind)
+                          (content . ((type . "text")
+                                      (text . ,text))))))))
+)
+
+(ert-deftest agent-shell--restore-summary-picks-first-user-and-last-agent ()
+  "Test summary accumulation keeps first user prompt and last agent reply."
+  (let ((state (list (cons :restore-summary nil))))
+    (agent-shell--restore-summary-init state)
+    (dolist (notif (list
+                    (agent-shell-tests--make-session-update "user_message_chunk" "Hello ")
+                    (agent-shell-tests--make-session-update "user_message_chunk" "world")
+                    (agent-shell-tests--make-session-update "agent_message_chunk" "Hi ")
+                    (agent-shell-tests--make-session-update "agent_message_chunk" "there")
+                    (agent-shell-tests--make-session-update "user_message_chunk" "second prompt")
+                    (agent-shell-tests--make-session-update "agent_message_chunk" "intermediate")
+                    (agent-shell-tests--make-session-update "tool_call" "ignored")
+                    (agent-shell-tests--make-session-update "agent_message_chunk" "final answer")))
+      (agent-shell--restore-summary-handle-notification state notif))
+    (agent-shell--restore-summary-commit-in-flight
+     (map-elt state :restore-summary))
+    (should (equal (map-elt (map-elt state :restore-summary) :first-user)
+                   "Hello world"))
+    (should (equal (map-elt (map-elt state :restore-summary) :last-agent)
+                   "final answer"))))
+
+(ert-deftest agent-shell--restore-summary-handles-non-text-content ()
+  "Test summary accumulator falls back to a placeholder for non-text content."
+  (let ((state (list (cons :restore-summary nil))))
+    (agent-shell--restore-summary-init state)
+    (agent-shell--restore-summary-handle-notification
+     state
+     '((method . "session/update")
+       (params . ((update . ((sessionUpdate . "user_message_chunk")
+                             (content . ((type . "image")))))))))
+    (agent-shell--restore-summary-commit-in-flight
+     (map-elt state :restore-summary))
+    (should (equal (map-elt (map-elt state :restore-summary) :first-user)
+                   "[image]"))))
+
+(ert-deftest agent-shell--use-session-load-p-modes ()
+  "Test `agent-shell--use-session-load-p' across context/protocol combinations."
+  ;; summary mode forces session/load when supported
+  (let ((agent-shell-restore-context 'summary))
+    (should (agent-shell--use-session-load-p
+             '((:supports-session-load . t)
+               (:supports-session-resume . t))))
+    ;; summary falls back to resume when load unsupported
+    (should-not (agent-shell--use-session-load-p
+                 '((:supports-session-load . nil)
+                   (:supports-session-resume . t)))))
+  ;; full mode forces session/load when supported
+  (let ((agent-shell-restore-context 'full))
+    (should (agent-shell--use-session-load-p
+             '((:supports-session-load . t)
+               (:supports-session-resume . t)))))
+  ;; minimal mode prefers resume when available
+  (let ((agent-shell-restore-context 'minimal))
+    (should-not (agent-shell--use-session-load-p
+                 '((:supports-session-load . t)
+                   (:supports-session-resume . t))))
+    ;; minimal falls back to load when resume unavailable
+    (should (agent-shell--use-session-load-p
+             '((:supports-session-load . t)
+               (:supports-session-resume . nil))))))
+
+(ert-deftest agent-shell--initiate-session-summary-mode-uses-session-load ()
+  "Test that `summary' mode bypasses `session/resume' in favor of `session/load'."
+  (with-temp-buffer
+    (let* ((agent-shell-session-strategy 'latest)
+           (agent-shell-restore-context 'summary)
+           (requests '())
+           (session-init-called nil)
+           (state (list (cons :buffer (current-buffer))
+                        (cons :client 'test-client)
+                        (cons :session (list (cons :id nil)
+                                             (cons :mode-id nil)
+                                             (cons :modes nil)))
+                        (cons :supports-session-list t)
+                        (cons :supports-session-load t)
+                        (cons :supports-session-resume t)
+                        (cons :restore-summary nil)
+                        (cons :active-requests nil)
+                        (cons :event-subscriptions nil))))
+      (setq-local agent-shell--state state)
+      (cl-letf (((symbol-function 'agent-shell--state)
+                 (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--update-fragment)
+                 (lambda (&rest _args) nil))
+                ((symbol-function 'agent-shell--update-header-and-mode-line)
+                 (lambda () nil))
+                ((symbol-function 'agent-shell-cwd)
+                 (lambda () "/tmp"))
+                ((symbol-function 'agent-shell--resolve-path)
+                 (lambda (path) path))
+                ((symbol-function 'agent-shell--mcp-servers)
+                 (lambda () []))
+                ((symbol-function 'acp-send-request)
+                 (lambda (&rest args)
+                   (push args requests)
+                   (let* ((request (plist-get args :request))
+                          (method (map-elt request :method)))
+                     (pcase method
+                       ("session/list"
+                        (funcall (plist-get args :on-success)
+                                 '((sessions . [((sessionId . "session-abc")
+                                                 (cwd . "/tmp")
+                                                 (title . "Some session"))]))))
+                       ("session/load"
+                        (funcall (plist-get args :on-success) '()))
+                       (_ (error "Unexpected method: %s" method)))))))
+        (agent-shell--initiate-session
+         :shell-buffer (current-buffer)
+         :on-session-init (lambda ()
+                            (setq session-init-called t)))
+        (should (equal (mapcar (lambda (req)
+                                 (map-elt (plist-get req :request) :method))
+                               (nreverse requests))
+                       '("session/list" "session/load")))
+        (should session-init-called)
+        (should-not (map-elt agent-shell--state :restore-summary))))))
 
 (provide 'agent-shell-tests)
 ;;; agent-shell-tests.el ends here
