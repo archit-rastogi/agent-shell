@@ -413,47 +413,55 @@ For API key authentication:
 		   (shell-command-to-string "source ~/.vibe/.env; echo $MISTRAL_API_KEY")))))
 #+end_src
 
-*** Cursor
+*** Opencode + local ollama Qwen2.5
 
-For login-based authentication (default):
-
-#+begin_src emacs-lisp
-(setq agent-shell-cursor-authentication
-      (agent-shell-cursor-make-authentication :login t))
-#+end_src
-
-For API key authentication:
+If ~opencode~ is not found by ~agent-shell~, you can add it to the search path
 
 #+begin_src emacs-lisp
-;; With string
-(setq agent-shell-cursor-authentication
-      (agent-shell-cursor-make-authentication :api-key "your-cursor-api-key-here"))
-
-;; With function
-(setq agent-shell-cursor-authentication
-      (agent-shell-cursor-make-authentication
-       :api-key (lambda () (auth-source-pass-get "secret" "cursor-api-key"))))
+(use-package agent-shell
+      :ensure t
+      :config
+         (add-to-list 'exec-path "~/.opencode/bin/"))
 #+end_src
 
-For auth token authentication:
+To register the local Qwen2.5:7b model in opencode, two files needs to be edited:
 
-#+begin_src emacs-lisp
-;; With string
-(setq agent-shell-cursor-authentication
-      (agent-shell-cursor-make-authentication :auth-token "your-cursor-auth-token"))
+~/.config/opencode/opencode.json~
+#+BEGIN_SRC js
+     {
+         "$schema": "https://opencode.ai/config.json",
+         "permission": {
+     	"edit": "ask",
+     	"bash": "ask",
+     	"webfetch": "allow"
+         },
+        "provider": {
+            "ollama": {
+     	   "name": "qwen2.5:7b",
+     	   "npm": "@ai-sdk/openai-compatible",
+                "options": {
+                    "baseURL": "http://localhost:11434/v1"
+                },
+                "models": {
+           	       "qwen2.5:7b": { "name": "Qwen2.5 7b" }
+                }
+            }
+        }
+     }
+#+END_SRC
 
-;; With function
-(setq agent-shell-cursor-authentication
-      (agent-shell-cursor-make-authentication
-       :auth-token (lambda () (auth-source-pass-get "secret" "cursor-auth-token"))))
+and a dummy auth file ~/.local/share/opencode/auth.json~
+
+#+begin_src js
+{
+    "ollama": {
+      "type": "api",
+  	  "key": "ollama"
+    }
+}
 #+end_src
 
-For no authentication (when already authenticated via =agent login=):
-
-#+begin_src emacs-lisp
-(setq agent-shell-cursor-authentication
-      (agent-shell-cursor-make-authentication :none t))
-#+end_src
+Huge thanks for /gdindi/ for finding and and describing this in https://github.com/xenodium/agent-shell/issues/526
 
 *** Customizing Available Agents
 
